@@ -25,10 +25,27 @@ inline void add_sources(IdxRange const& sources, Idx /* bus_number */, YBus<sym>
 
 template <symmetry_tag sym>
 inline void add_linear_loads(IdxRange const& load_gens_per_bus, Idx /* bus_number */, PowerFlowInput<sym> const& input,
-                             ComplexTensor<sym>& diagonal_element) {
+                             ComplexTensor<sym>& diagonal_element, std::vector<LoadGenType> const& load_gen_type) {
     for (auto load_number : load_gens_per_bus) {
-        // YBus_diag += -conj(S_base)
-        add_diag(diagonal_element, -conj(input.s_injection[load_number]));
+        LoadGenType const type = load_gen_type[load_number];
+        if (type == LoadGenType::const_pv) {
+
+            if constexpr (is_symmetric_v<sym>) {
+                auto const& tmp = -conj(input.load_gen[load_number].s_injection);
+                auto tmp2 = std::complex(real(tmp), 0.0);
+                add_diag(diagonal_element, tmp2);
+            } else {
+                auto const& tmp = -conj(input.load_gen[load_number].s_injection); throw MissingCaseForEnumError("Not implemented for PV nodes", type);
+                // TODO: #185 q = 0 setzen!!!!!!
+                add_diag(diagonal_element, tmp);
+            }
+
+            // TODO: #185 check if q=0 correct for linear solver
+            /////////////add_diag(diagonal_element, -conj({real(input.load_gen[load_number].s_injection), 0.0}));
+        } else {
+            // YBus_diag += -conj(S_base)
+            add_diag(diagonal_element, -conj(input.load_gen[load_number].s_injection));
+        }
     }
 }
 
@@ -38,11 +55,12 @@ inline void prepare_linear_matrix_and_rhs(YBus<sym> const& y_bus, PowerFlowInput
                                           grouped_idx_vector_type auto const& sources_per_bus,
                                           SolverOutput<sym>& output, ComplexTensorVector<sym>& mat_data) {
     IdxVector const& bus_entry = y_bus.lu_diag();
+    auto const& load_gen_type = y_bus.math_topology().load_gen_type;
     for (auto const& [bus_number, load_gens, sources] : enumerated_zip_sequence(load_gens_per_bus, sources_per_bus)) {
         Idx const diagonal_position = bus_entry[bus_number];
         auto& diagonal_element = mat_data[diagonal_position];
         auto& u_bus = output.u[bus_number];
-        add_linear_loads(load_gens, bus_number, input, diagonal_element);
+        add_linear_loads(load_gens, bus_number, input, diagonal_element, load_gen_type); // TODO: #185 need u_bus here too? to set U for PV node?
         add_sources(sources, bus_number, y_bus, input.source, diagonal_element, u_bus);
     }
 }
@@ -150,17 +168,18 @@ inline void calculate_load_gen_result(IdxRange const& load_gens, Idx bus_number,
         switch (LoadGenType const type = load_gen_func(load_gen); type) {
             using enum LoadGenType;
 
+        case const_pv:
         case const_pq:
             // always same power
-            output.load_gen[load_gen].s = input.s_injection[load_gen];
+            output.load_gen[load_gen].s = input.load_gen[load_gen].s_injection;
             break;
         case const_y:
             // power is quadratic relation to voltage
-            output.load_gen[load_gen].s = input.s_injection[load_gen] * abs2(output.u[bus_number]);
+            output.load_gen[load_gen].s = input.load_gen[load_gen].s_injection * abs2(output.u[bus_number]);
             break;
         case const_i:
             // power is linear relation to voltage
-            output.load_gen[load_gen].s = input.s_injection[load_gen] * cabs(output.u[bus_number]);
+            output.load_gen[load_gen].s = input.load_gen[load_gen].s_injection * cabs(output.u[bus_number]);
             break;
         default:
             throw MissingCaseForEnumError("Power injection", type);
