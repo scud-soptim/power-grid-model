@@ -160,7 +160,6 @@ J.L -= -dQ_cal_m/dV
 #include <algorithm>
 #include <complex>
 #include <functional>
-#include <span>
 #include <vector>
 
 namespace power_grid_model::math_solver {
@@ -287,16 +286,6 @@ class NewtonRaphsonPFSolver : public IterativePFSolver<sym_type, NewtonRaphsonPF
     void solve_matrix() { sparse_solver_.prefactorize_and_solve(data_jac_, perm_, del_x_pq_, del_x_pq_); }
 
     // Get maximum deviation among all bus voltages
-    struct QLimitSwitch {
-        Idx bus{};
-        Idx load_gen{};
-        Idx voltage_regulator{};
-        IntS limit_violated{}; // -1: q_min, +1: q_max
-        RealValue<sym> q_clamped{};
-    };
-
-    std::span<QLimitSwitch const> q_limit_switches() const { return q_limit_switches_; }
-
     double iterate_unknown(ComplexValueVector<sym>& u) {
         double max_dev = 0.0;
         // loop each bus as i
@@ -349,6 +338,14 @@ class NewtonRaphsonPFSolver : public IterativePFSolver<sym_type, NewtonRaphsonPF
     struct QLimitClamp {
         bool active{};
         RealValue<sym> q{};
+    };
+
+    struct QLimitSwitch {
+        Idx bus{};
+        Idx load_gen{};
+        Idx voltage_regulator{};
+        IntS limit_violated{}; // -1: q_min, +1: q_max
+        RealValue<sym> q_clamped{};
     };
 
     std::vector<BusType> bus_types_;
@@ -577,7 +574,7 @@ class NewtonRaphsonPFSolver : public IterativePFSolver<sym_type, NewtonRaphsonPF
 
             RealValue<sym> const q_required = specified_regulating_q - del_x_pq_[bus].q();
             bool bus_switched = false;
-            for (auto const [load_gen, regulator] : active_regulators) {
+            for (auto const& [load_gen, regulator] : active_regulators) {
                 auto const& regulator_input = input.voltage_regulator[regulator];
                 IntS const limit = violated_limit(q_required, regulator_input.q_min, regulator_input.q_max);
                 if (limit == 0) {

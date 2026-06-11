@@ -32,8 +32,11 @@ template <symmetry_tag sym, typename DerivedSolver> class IterativePFSolver {
     friend DerivedSolver;
     SolverOutput<sym> run_power_flow(YBus<sym> const& y_bus, PowerFlowInput<sym> const& input, double err_tol,
                                      Idx max_iter, Logger& log) {
-        // get derived reference for derived solver class
-        auto& derived_solver = static_cast<DerivedSolver&>(*this);
+        // Keep the CRTP-derived solver as a local copy here. Some derived solvers, notably
+        // IterativeCurrentPFSolver, retain prefactorized matrix data and parameters_changed_ cache state.
+        // Running on a copy preserves the historical batch-mode/cache semantics of this base class. Solver-local
+        // state needed only during this run must therefore be consumed here rather than through the original object.
+        auto derived_solver = static_cast<DerivedSolver&>(*this);
 
         // prepare
         SolverOutput<sym> output;

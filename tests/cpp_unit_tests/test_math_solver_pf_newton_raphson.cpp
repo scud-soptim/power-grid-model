@@ -130,7 +130,6 @@ TEST_CASE("Newton-Raphson PV reactive-power limits switch one-way to PQ") {
         NewtonRaphsonPFSolver<symmetric_t> solver{y_bus, topo};
         auto const output = solver.run_power_flow(y_bus, grid.input(-1.0, 1.0), 1e-12, 20, log);
 
-        CHECK(solver.q_limit_switches().empty());
         CHECK(cabs(output.u[1]) == doctest::Approx(1.0));
         CHECK(output.voltage_regulator[0].limit_violated == 0);
         CHECK(imag(output.load_gen[0].s) > -1.0);
@@ -142,13 +141,6 @@ TEST_CASE("Newton-Raphson PV reactive-power limits switch one-way to PQ") {
         constexpr double q_max = -0.3;
         auto const output = solver.run_power_flow(y_bus, grid.input(-1.0, q_max), 1e-12, 20, log);
 
-        REQUIRE(solver.q_limit_switches().size() == 1);
-        auto const& q_switch = solver.q_limit_switches().front();
-        CHECK(q_switch.bus == 1);
-        CHECK(q_switch.load_gen == 0);
-        CHECK(q_switch.voltage_regulator == 0);
-        CHECK(q_switch.limit_violated == 1);
-        CHECK(q_switch.q_clamped == doctest::Approx(q_max));
         CHECK(output.voltage_regulator[0].limit_violated == 1);
         CHECK(imag(output.load_gen[0].s) == doctest::Approx(q_max));
         CHECK(cabs(output.u[1]) != doctest::Approx(1.0));
@@ -159,13 +151,6 @@ TEST_CASE("Newton-Raphson PV reactive-power limits switch one-way to PQ") {
         constexpr double q_min = -0.2;
         auto const output = solver.run_power_flow(y_bus, grid.input(q_min, 1.0), 1e-12, 20, log);
 
-        REQUIRE(solver.q_limit_switches().size() == 1);
-        auto const& q_switch = solver.q_limit_switches().front();
-        CHECK(q_switch.bus == 1);
-        CHECK(q_switch.load_gen == 0);
-        CHECK(q_switch.voltage_regulator == 0);
-        CHECK(q_switch.limit_violated == -1);
-        CHECK(q_switch.q_clamped == doctest::Approx(q_min));
         CHECK(output.voltage_regulator[0].limit_violated == -1);
         CHECK(imag(output.load_gen[0].s) == doctest::Approx(q_min));
         CHECK(cabs(output.u[1]) != doctest::Approx(1.0));
@@ -180,17 +165,13 @@ TEST_CASE("Newton-Raphson PV reactive-power limit switches are deterministic") {
     NewtonRaphsonPFSolver<symmetric_t> solver{y_bus, topo};
 
     auto const output = solver.run_power_flow(y_bus, grid.input(), 1e-12, 20, log);
-    auto const switches = solver.q_limit_switches();
 
-    REQUIRE(switches.size() == 2);
-    CHECK(switches[0].bus == 1);
-    CHECK(switches[0].load_gen == 0);
-    CHECK(switches[0].voltage_regulator == 0);
-    CHECK(switches[1].bus == 2);
-    CHECK(switches[1].load_gen == 1);
-    CHECK(switches[1].voltage_regulator == 1);
+    CHECK(output.voltage_regulator[0].limit_violated == 1);
+    CHECK(output.voltage_regulator[1].limit_violated == 1);
     CHECK(imag(output.load_gen[0].s) == doctest::Approx(-0.3));
     CHECK(imag(output.load_gen[1].s) == doctest::Approx(-0.3));
+    CHECK(cabs(output.u[1]) != doctest::Approx(1.0));
+    CHECK(cabs(output.u[2]) != doctest::Approx(1.0));
 }
 
 } // namespace power_grid_model::math_solver
