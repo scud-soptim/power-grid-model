@@ -33,7 +33,7 @@ template <symmetry_tag sym, typename DerivedSolver> class IterativePFSolver {
     SolverOutput<sym> run_power_flow(YBus<sym> const& y_bus, PowerFlowInput<sym> const& input, double err_tol,
                                      Idx max_iter, Logger& log) {
         // get derived reference for derived solver class
-        auto derived_solver = static_cast<DerivedSolver&>(*this);
+        auto& derived_solver = static_cast<DerivedSolver&>(*this);
 
         // prepare
         SolverOutput<sym> output;
@@ -77,6 +77,9 @@ template <symmetry_tag sym, typename DerivedSolver> class IterativePFSolver {
         {
             Timer const sub_timer{log, LogEvent::calculate_math_result};
             calculate_result(y_bus, input, output);
+            if constexpr (requires { derived_solver.finalize_derived_result(input, output); }) {
+                derived_solver.finalize_derived_result(input, output);
+            }
         }
         // Manually stop timers to avoid "Max number of iterations" to be included in the timing.
         main_timer.stop();
