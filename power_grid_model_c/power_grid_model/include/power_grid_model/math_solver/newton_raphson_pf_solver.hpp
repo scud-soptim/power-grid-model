@@ -243,6 +243,10 @@ class NewtonRaphsonPFSolver : public IterativePFSolver<sym_type, NewtonRaphsonPF
                                               this->sources_per_bus_.get(), output, linear_mat_data);
         linear_sparse_solver.prefactorize_and_solve(linear_mat_data, linear_perm, output.u, output.u);
 
+        // FRIE: Ist das Fill und Clear nur deswegen da, weil in InterativePfSolver::run_power_flow() für den derived_solver
+        //       zwischenzeitlich eine Referenz benutz wurde, so dall alte Werte gelöscht/überschrieben werden mussten?
+        //       Jetzt wurde die Referenz wieder entfernt und es wird eine Kopie des derived_solvers benutzt. Kann jetzt
+        //       auch das Filling und Clearing wieder gelöscht werden? D.h. das Setzen der Initialwerte im Konstruktor wäre ausreichend?
         std::ranges::fill(bus_types_, BusType::pq);
         std::ranges::fill(q_limit_clamps_, QLimitClamp{});
         q_limit_switches_.clear();
@@ -276,6 +280,20 @@ class NewtonRaphsonPFSolver : public IterativePFSolver<sym_type, NewtonRaphsonPF
                 add_loads(load_gens, bus_number, diagonal_position, input, load_gen_type);
                 add_sources(sources, bus_number, diagonal_position, y_bus, input, u);
             }
+            // FRIE: seltsames Verhalten, zu klären wann und wie muss Matrix/Vektor geändert werden muss, wenn PV/PQ Switch erfolgt
+            //   q_limits_need_initial_check_ == true ~ Es gibt mindestens eine nutzbare Q-Grenze -> wird nach erster Iteration wieder auf FALSE gesetzt !!!
+            //
+            //   Warum schleife? Erwartet man dass man mehr als einmal reinläuft. Wenn nicht, kann man enforce_q_limits stattdessen einmal vor der Schleife ausführen?
+            //     if ${something} {
+            //       enforce_q_limits(input);
+            //     }
+            //     for (...) {
+            //       .. wie bisher ...
+            //     }
+            //
+            //   Den Bus_Injection Wert von der letzten Iteration müsste ich hier doch haben.
+            //   D.H. Kann ich eine Grenzwertverletzung feststellen bevor ich die Matrix und den Deltavektor aufbaue??
+            //   Wenn ja, dann will ich sie nochmal anpassen bevor in den Solver gehe und dann wäre die wiederholte Ausführung hier zulässig !!
             buses_switched = !q_limits_need_initial_check_ && enforce_q_limits(input);
         } while (buses_switched);
 
@@ -312,6 +330,23 @@ class NewtonRaphsonPFSolver : public IterativePFSolver<sym_type, NewtonRaphsonPF
     }
 
     void finalize_derived_result(PowerFlowInput<sym> const& input, SolverOutput<sym>& output) const {
+        // FRIE: Wenn switch, dann muss das Q bzw. das Q am  Output.Load/Gen angepasst werden.
+        //       In Output.voltage_regulator muss gesetzt werden dass Grenze verletzt wurde.
+
+        // FRIE: Funktion erscheint fehlt am Platz und wird ganz häßlich in der Basisklasse aufgerufen:
+        //       if constexpr (requires { derived_solver.finalize_derived_result(input, output); }) {
+        //           derived_solver.finalize_derived_result(input, output);
+        //       }
+        //       Wenn es nicht anders geht, dann besser `finalize_derived_result` einfach aufrufen und dann
+        //       in der anderen Ableitung eine leere Implementierung bereitstellen.
+        //       ABER: eigentlich würde ich die ganze Funktion so nicht haben wollen. Stattdessen würde ich das
+        //       ganze in ::calculate_voltage_regulator_result() in common_solver_functions.hpp umsetzen wollen.
+        //       Dort sollte man aus die Output-Struct der Regler und Load/Gens zugreifen können. Allerdings kommt
+        //       man dort evtl. nicht and die Informationen über die Bustypen heran. Weil im Bustyp steht evtl. schon die
+        //       ganze notwendige Info drin, z.B. ::pv_fixed_to_q_min. Weil dann kan man die Grenzwerte wieder aus dem
+        //       Inputobjekt lesen (und wo nötig mit der Spannung multiplizieren).
+        //       BITTE PRÜFEN, ab das möglich ist und man die relevanten Infos durchreichen kann, ohne bestehende
+        //       Strukturen zu sehr zu verändern. Wenn nicht, dann kann man weiter mit diesen Ansatz arbeiten.
         for (QLimitSwitch const& q_switch : q_limit_switches_) {
             auto& load_gen_output = output.load_gen[q_switch.load_gen];
             load_gen_output.s = real(input.s_injection[q_switch.load_gen]) + 1.0i * q_switch.q_clamped;
@@ -336,11 +371,14 @@ class NewtonRaphsonPFSolver : public IterativePFSolver<sym_type, NewtonRaphsonPF
     BlockPermArray perm_;
 
     struct QLimitClamp {
+        // FRIE: Wenn man knotenbasiert arbeiten würde, dann kann ich mir vorstellen, dass man dieses Stuct nicht benötigen wird.
+        //       Stattdessen hätte man was ähnliches für den Knoten.
         bool active{};
         RealValue<sym> q{};
     };
 
     struct QLimitSwitch {
+        // FRIE: Info über Load/Gen bzw. Regulator. Wenn man knotenbasiert arbeiten würde, dann brauch man dieses Struct wahrscheinlich nicht.
         Idx bus{};
         Idx load_gen{};
         Idx voltage_regulator{};
@@ -348,24 +386,35 @@ class NewtonRaphsonPFSolver : public IterativePFSolver<sym_type, NewtonRaphsonPF
         RealValue<sym> q_clamped{};
     };
 
+    // FRIE: bus_types_ ist aktuell ein Vektor von Enum-Werten. Meine Idee war stattdessen ein Struct zu benutzen, wo der Typ eine Property
+    //       wäre. Andere Properties würden z.B. vorberechnete aufsummiert Q-Grenzwerte für den Bus enthalten, so dass man weniger über
+    //       Load/Gebs/Regler iterieren muss. Bei einem großen Netzt mit vielen PQ und wenigen PV Knoten könnte der Vektor etwas groß werden.
+    //       Dann könnte man das splitten. bus_types_ enthält für alle Busse ein kleines Struct mit BusType und Index für anderen Vektor
+    //       (z.B. [{type: pq, q_idx: 0}, {type: pv, q_idx: 1}, {type: pq, q_idx: 0}, ...]). Und ein anderer Verktor enthält dann ein Struct
+    //       nur für regulierende Busse mit den Properties für vorberechnete Q-Grenzwerte (z.B. [{bus_idx: 7, q_limit_max: 100, q_limit_min: -100}, ...])
+    //       und evtl. weitere Properties.
     std::vector<BusType> bus_types_;
+
     std::vector<QLimitClamp> q_limit_clamps_;
     std::vector<QLimitSwitch> q_limit_switches_;
     bool q_limits_need_initial_check_{};
     std::reference_wrapper<DenseGroupedIdxVector const> voltage_regulators_per_load_gen_;
 
     bool has_usable_q_limits(PowerFlowInput<sym> const& input) const {
+        // !! FRIE: Schleife ähnlich zu der in `set_u_ref_and_bus_types` => MERGEN
         auto const& regulators_per_load_gen = voltage_regulators_per_load_gen_.get();
         for (auto const& [bus, load_gens] : enumerated_zip_sequence(this->load_gens_per_bus_.get())) {
             if (bus_types_[bus] != BusType::pv) {
                 continue;
             }
             for (Idx const load_gen : load_gens) {
+                // FRIE: hier wird load_gen_status geprüft und in `set_u_ref_and_bus_types` nicht. Warum? ist das implizit gegeben? TESTEN
                 if (input.load_gen_status[load_gen] == 0) {
                     continue;
                 }
                 for (Idx const regulator : regulators_per_load_gen.get_element_range(load_gen)) {
                     auto const& regulator_input = input.voltage_regulator[regulator];
+                    // FRIE: prüft, ob es mindestens eine nutzbare Q-Grenze gibt.
                     if (regulator_input.status != 0 &&
                         (!is_nan(regulator_input.q_min) || !is_nan(regulator_input.q_max))) {
                         return true;
@@ -394,6 +443,8 @@ class NewtonRaphsonPFSolver : public IterativePFSolver<sym_type, NewtonRaphsonPF
                         auto const& regulator = input.voltage_regulator[voltage_regulator_idx];
                         u[bus_idx] = regulator.u_ref * phase_shift(u[bus_idx]);
                         bus_types_[bus_idx] = BusType::pv;
+                        // TODO: `bus_types_` erweitern (und umbenennen). Soll neben bus_type auch andere Daten enthalten, z.B. ob Q Grenzen vorhandend sind und deren Wert
+                        // TODO: festhalten, dass es mindestens eine nutzbare Q-Grenze gibt
                         break;
                     }
                 }
@@ -464,9 +515,41 @@ class NewtonRaphsonPFSolver : public IterativePFSolver<sym_type, NewtonRaphsonPF
         }
     }
 
+    // FRIE: Inhalt von `apply_pv_constraints` wurde vorher am Ende der  Funktion `prepare_matrix_and_rhs_from_network_perspective`
+    //       ausgeführt und wurde jetzt herausgezogen. Der zusätzliche Unterschied ist jetzt, dass vorher das so aufgerufen wurde
+    //
+    //       prepare_matrix_and_rhs_from_network_perspective(y_bus, u, bus_entry); <-- Hier wurden PV constraint bereits angewendet, jacobi.m() und jacobi.l() angepasst
+    //       for (auto const& [bus_number, load_gens, sources] : enumerated_zip_sequence(...)) {
+    //          add_loads(...); <-- hier wird `del_x_pq_[bus_number].q()` angepasst, aufsummieren der Q Werte der Load/Gens am Bus
+    //                          <-- am Ende `del_x_pq_[bus_number].q() = 0.0` gesetzt/überschrieben für PV-Busse
+    //          add_sources(...);
+    //       }
+    //
+    //       Jetzt ist der Ablauf so:
+    //       do {
+    //           prepare_matrix_and_rhs_from_network_perspective(y_bus, u, bus_entry); <-- PV Constraints rausgezogen
+    //           for (auto const& [bus_number, load_gens, sources] :enumerated_zip_sequence(...)) {
+    //               add_loads(...); <-- hier wird nicht mehr `del_x_pq_[bus_number].q() = 0` gesetzt
+    //               add_sources(...);
+    //           }
+    //           buses_switched = !q_limits_need_initial_check_ && enforce_q_limits(input); <-- enforce_q_limits arbeitet mit spezifizierten, evtl. geclampten Q-Werten in `del_x_pq_[bus_number].q()`
+    //       } while (buses_switched);
+    //       apply_pv_constraints(y_bus); <-- `del_x_pq_[bus_number].q() = 0.0` wird hier einmal gesetzt/überschrieben für PV-Busse
+
     void apply_pv_constraints(YBus<sym> const& y_bus) {
         IdxVector const& indptr = y_bus.row_indptr_lu();
         IdxVector const& indices = y_bus.col_indices_lu();
+
+        // PV-bus voltage identity row:
+        // For PV buses, the Q-equation is replaced by the algebraic constraint
+        //     rPV = V - Vset = 0.
+        // Since the state vector uses relative voltage increments deltaV_rel = deltaV / V,
+        // the derivative drPV/dDeltaV_rel equals the current voltage magnitude V.
+        // Therefore:
+        //   - all off-diagonal voltage derivatives (L block) are zero,
+        //   - all Theta-derivatives (M block) are zero,
+        //   - only the diagonal L entry is set to V.
+        // This removes the Q-equation and enforces the PV voltage constraint in the NR step.
         for (Idx row = 0; row != this->n_bus_; ++row) {
             if (bus_types_[row] != BusType::pv) {
                 continue;
@@ -546,7 +629,7 @@ class NewtonRaphsonPFSolver : public IterativePFSolver<sym_type, NewtonRaphsonPF
     }
 
     bool enforce_q_limits(PowerFlowInput<sym> const& input) {
-        bool switched = false;
+        bool switched = false; // FRIE: Sagt aus ob ein PV/PQ Switch erfolgte !!!
         auto const& regulators_per_load_gen = voltage_regulators_per_load_gen_.get();
 
         // The grouped topology ranges are ordered by bus, load-generator, then regulator index.
@@ -555,14 +638,32 @@ class NewtonRaphsonPFSolver : public IterativePFSolver<sym_type, NewtonRaphsonPF
             if (bus_types_[bus] != BusType::pv) {
                 continue;
             }
+            // FRIE: nur für PV Busse
 
+            // FRIE: Iteration per Bus und seinen Load/Gens
             std::vector<std::pair<Idx, Idx>> active_regulators;
             RealValue<sym> specified_regulating_q{};
             for (Idx const load_gen : load_gens) {
                 for (Idx const regulator : regulators_per_load_gen.get_element_range(load_gen)) {
                     if (input.load_gen_status[load_gen] != 0 && input.voltage_regulator[regulator].status != 0) {
+                        // FRIE: merkt sich die IDs der relevanten Regler und Load/gens
                         active_regulators.emplace_back(load_gen, regulator);
+
+                        // FRIE: summiert den spezifizierten Q Wert des Busses NUR für regulierende Load/Gens, nicht regulierente Load/Gens werden übersprungen !!
+                        // FRIE: berechnet Q in Abhängigkeit der Spannung für die Typen const_pq, const_i, const_y
+                        // FRIE: da für regulierende Load/Gens das Q neu berechnet wird, ist das Specified-Q oft 0 (muss aber nicht sein). Ist das relevant ???
                         specified_regulating_q += specified_q(load_gen, bus, input);
+
+                        // FRIE: Wenn die Grenzwerte für die interne Berechnung an die Knoten gehängt werden, dann
+                        //       *müssen* beim Verleichen die Q-Werte der nichtregulierenden Load/Gens berücksichtigt werden.
+                        //       Entweder direkt auf Grenzwerte aufaddieren, oder vor dem Vergeich von der bus_injection abziehen !!!!!
+
+                        // FRIE: Prüfen, ob/wie man vermeiden kann, dass in jeder Iteration immer wieder über die Regulators iteriert werden muss.
+                        //       Eine Lösung mit Knotenwerten wäre vermeintlich schöner und einfacher und performanter?
+                        //       Annahme ist, dass es **nicht** passieren kann, dass an einem Knoten ein Regler geswitcht wird,
+                        //       aber ein zweiter Regler weiterhin aktiv bleiben kann !!!!!!  WEIL, ein PV Knoten is ein Knoten
+                        //       mit mindestens einem aktiven Regulator. D.h. der Knoten bliebe weiterhin PV und das ausschalten nur eines Regler
+                        //       wäre dann kein PV/PQ Switch, und dann ist die Frage warum überhaupt, entweder alle Regler des Knotens oder keinen.
                     }
                 }
             }
@@ -570,16 +671,44 @@ class NewtonRaphsonPFSolver : public IterativePFSolver<sym_type, NewtonRaphsonPF
             // behavior for those buses until a dedicated allocation strategy is implemented.
             if (active_regulators.size() != 1) {
                 continue;
+                // FRIE: d.h. bei mehreren Regulatoren an einem Bus stillschweigend nichts tun ?!?!?
+                //       weil noch ist nichts passiert, `active_regulators` und `specified_regulating_q` sind lokale Variablen innerhalb der Schleife
+
+                // FRIE: würde man knotenbasiert anstatt reglerbasiert arbeiten, dann wäre das Mehrregler-"Problem" beim Switch automatisch behandelt !!
             }
 
+            // FRIE:
+            //  specified_regulating_q = Summe der specified-Q Werte der Load/Gens mit aktivem Regler (spannungsabhängig, wenn const_i oder const_y)
+            //                           berechnet aus Input-Werten und Spannung aus vorheriger Iteration (x_[bus].v()), nicht aus del_x_pq_[bus].q() !!!
+            //  del_x_pq_[bus].q()     = Bus_Injection als Summe der Q-Wert aller Load/Gens für PV Knoten ??? (nicht 0, weil `del_x_pq_[bus].q() = 0` erst später gesetzt wird)
+            //                           !!! Wert kann Grenzwert verletzen !!!
+            //  => q_required          = Different zwischen Bus_Injection und Specified_Q, also das was durch die Spannungsregulierung dazugekommen sein muss
+            //                           UNKLAR warum dieser Wert mit den Grenzwerten der Regulatoren verglichen wird ???
+            //                           WEIL der GRenzwert ist ja nicht für die Rest- oder Differenzleistung, sondern für die Gesamtleistung des Genrators !!!
+            //                           Müsste nicht stattdessen von der Bus_Injection die Summe der Specified_Q Werte der UNREGULIERTEN Load/Gens abgezogen werden.
+            //                           Der sich ergebende Wert würde dann von den REGULIERENDEN Load/Gens bereitgestellt werden müssen, und dieser Werte müsste
+            //                           dann mit gen Grenzwerten der Regulatoren verglichen werden ???
+            //                           => BITTE PRÜFEN
+            //                           ODER ALTERNATIV, wenn man knotenbasiert arbeiten würde, dann wäre der Grenzwert schon vorberechnet worden und man würde nur
+            //                           noch diesen Wert mit der Bus_Injection vergleichen müssen ?!?!? (evtl. noch Summe der Specified_Q hier oder dort abziehen bzw. addieren)
+            //                           Bei einer Verletzung würde man nur den Knotentyp ändern und sich merken welche Grenze verletzt wurde. Die Regulatoren
+            //                           könnte man vermutlich unangetastet lassen, weil die relevante Info am Knoten liegen würde.
             RealValue<sym> const q_required = specified_regulating_q - del_x_pq_[bus].q();
             bool bus_switched = false;
-            for (auto const& [load_gen, regulator] : active_regulators) {
+            for (auto const& [load_gen, regulator] : active_regulators) { // FRIE: iteriert über oben aufgesammelte relevante Regler
                 auto const& regulator_input = input.voltage_regulator[regulator];
+                 // FRIE: 0 = keine Verletzung, 1 = Verletzung von q_max, -1 = Verletzung von q_min
                 IntS const limit = violated_limit(q_required, regulator_input.q_min, regulator_input.q_max);
                 if (limit == 0) {
                     continue;
                 }
+                // FRIE: *Schleife* über aktive Regler, obwohl nach obiger Konstruktion nur eine aktiver Regler in den Vektor hinzugefügt wird.
+                //       Sollten in Zukunft mehrere Regler reinkommen, reicht es nicht mehr die Verletzung des ersten Reglers als Verletzung des Busses zu interpretieren.
+                //       Dann müsste man z.B: q_required iterativ reduzieren und schauen ob am Ende noch was übrig bleibt, was nicht durch die Regler abgedeckt werden,
+                //       was dann einen PV/PQ-Switch auslösen würde.
+
+                // FRIE: ODER, man rechnet Knotenbasiert und macht einen PV/PQ Switch wenn der kombinierte Knoten-Grenzwert verletzt wird.
+
                 RealValue<sym> const q_clamped = clamp_q(q_required, regulator_input.q_min, regulator_input.q_max);
                 q_limit_clamps_[load_gen] = {.active = true, .q = q_clamped};
                 q_limit_switches_.push_back({.bus = bus,
@@ -587,6 +716,15 @@ class NewtonRaphsonPFSolver : public IterativePFSolver<sym_type, NewtonRaphsonPF
                                              .voltage_regulator = regulator,
                                              .limit_violated = limit,
                                              .q_clamped = q_clamped});
+                // FRIE: Hier wurde ein neuer Vektor benutzt und dort ein neues Element mit Switch-Infos hinzugefügt.
+                //       Das ist OK, wenn man keinen Switch zurück zu PV machen will. Sollte man es doch wollen, dann müsste hier
+                //       das hinzugefügte Element wieder entfernt werden !!!
+
+                // FRIE: Wenn man stattdessen das Array `bus_types_` erweitern würde, dann würde man dort die Info der Position des Bus-Index schreiben.
+                //       Evtl. reicht es nur den BusType von ::pv auf ::pv_fixed_to_q_min oder ::pv_fixed_to_q_max zu ändern.
+                //       Der Switch zurück zu PV würde dann automatisch durch Setzen des Typs zu ::pv erfolgen. Die Jacobi-Matrix und der Delta-Vektor
+                //       würden dann den Switch zurück automatisch abbilden (Berechung müsste evtl. neu getriggert werden).
+
                 bus_switched = true;
             }
             if (bus_switched) {
@@ -603,6 +741,10 @@ class NewtonRaphsonPFSolver : public IterativePFSolver<sym_type, NewtonRaphsonPF
         using enum LoadGenType;
         for (Idx const load_number : load_gens) {
             if (q_limit_clamps_[load_number].active) {
+                // FRIE: P und Q werden jetzt wie in `add_const_power_load` aufsummiert, wobei für Q die geclampten Werte aus `q_limit_clamps_` benutzt werden.
+                // FRIE: ABER, für const_y oder const_i werden in `add_const_impedance_load` und `add_const_current_load`
+                //       noch die Diagonalwerte der Jacobi-Matrix angepasst. Für geclampte Load/Gens wird das hier NICHT MEHR gemacht ?!?!?
+                //       ??? IST DAS SO KORREKT, ODER IST DAS EIN BUG ???
                 del_x_pq_[bus_number].p() += real(input.s_injection[load_number]);
                 del_x_pq_[bus_number].q() += q_limit_clamps_[load_number].q;
                 continue;
@@ -623,6 +765,34 @@ class NewtonRaphsonPFSolver : public IterativePFSolver<sym_type, NewtonRaphsonPF
                 throw MissingCaseForEnumError("Jacobian and deviation calculation", type);
             }
         }
+        // FRIE: hier wurde früher "del_x_pq_[bus_number].q() = 0.0;" gesetzt wenn BusType = PV war. Jetzt rausgezogen in `apply_pv_constraints()` !!!!
+
+        // FRIE: Nach meinem Verständnis "müsste" die Funktion wie bisher P und Q aufsummieren und
+        //       für const_y und const_i noch die Jacobi-Matrix anpassen. Für geswitchte Busse müsste
+        //       aber nicht specified-Q sondern der Grenzwert aufsummiert werden, ob er jetzt aus dem
+        //       Input-Objekt oder woanders herkommt.
+        //       Irgendwie denke ich, dass man die Summer der Grenzwerte initial vorberechnen kann,
+        //       aber ich bin dann wiederum skeptisch, weil die Summe der spezified-Qs ist spannungsabhängig
+        //       wenn const_i oder const_y Load/Gens vorhanden sind. Aber dann kann ich sie nicht vorher
+        //       alle aufsummieren und später mit der Spannung multiplizieren, weil nich alle gleich spannungsabhängig sein müssen,
+        //       so dass letztenlich die Aufsummierung immer zur Laufzeit in der Iteration erfolgen muss.
+        //       IST DAS TATSÄCHLICH SO ???
+
+        // FRIE: ENTSCHEIDENDE FRAGE: ist der Q-Grenzwert für Load/Gens von Typ const_y bzw. const_i spannungsabhängig oder nicht ?!?!?!?!
+        //       Wenn nein, dann kann der Wert initial vorberechnet werden. Wenn ja, dann muss er in jeder Iteration neue berechnet werden !!!
+        //       KI behauptet, die Grenzen könnten theoretisch V-abhängig sein, aber andererseits sind das eher Load-Modelle, und Gens sind const_pq.
+
+        // FRIE: Wenn keine Spannungsabhängigkeit für Grenzwerte besteht,evtl. neue BusType einführen (BusType::pv_fixed_to_q_min, BusType::pv_fixed_to_q_max),
+        //       so dass man weiß welchen Wert man nehmen muss
+
+        // FRIE: ABER: Mit dem Hintergrund, dass ein PV/PQ Switch "datensatz-seitig" erfolgen könnte, indem man
+        //       den Regulator deaktiviert und stattdessen die specified-Q Werte auf Min/Max setzt, würde folgen
+        //       dass hier klassisch die specified-Q Werte (was dann Grenzwerte wären) als spannungsabhängig berücksichtigt würden.
+        //       ES SEI DENN, die Grenzwerte sind tatsächlich nicht spannungsabhängig. Dann wäre ein manuelles Handling im Datensatz unzulässig !!!
+
+        // FRIE: Selbst wenn Grenzwerte für const_i oder const_y spannungsabhängig sind, könnte man vermutlich trotzdem knotenbasiert
+        //       arbeiten und den Knoten-Grenzwert als Summe der Grenzwerte der Load/Gens/Regulators nicht einmal initial vorberechnen,
+        //       sondern einmal am Anfang der Iteration, z.B. in `prepare_matrix_and_rhs` !?!?!
     }
 
     void add_const_power_load(Idx bus_number, Idx load_number, PowerFlowInput<sym> const& input) {

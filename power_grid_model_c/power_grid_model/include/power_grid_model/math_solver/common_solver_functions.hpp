@@ -217,7 +217,11 @@ inline void calculate_voltage_regulator_result(Idx const& bus_number, PowerFlowI
         // limits
         if constexpr (is_symmetric_v<sym>) {
             auto const q_regulator = q_remaining / num_regulating_gens;
+            // FRIE: Info über Grenzwertverletzungen ist in finalize_derived_result() des Solvers passiert.
+            //       PRÜFEN, ob man das auch hier machen kann und welche Infos und wie weiter gereicht werden müssen.
             output_regulator.limit_violated = 0; // no violation
+
+            // FRIE: TODO: Testnetz als JSON anlegen und prüfen, ob PV/PQ Switching funktioniert. Nur Unittests erscheinen nicht als ausreichend !!!
 
             auto const& s_load_gen = output.load_gen[load_gen].s;
             output.load_gen[load_gen].s = ComplexValue<sym>{real(s_load_gen), q_regulator};
